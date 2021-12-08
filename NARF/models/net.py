@@ -5,7 +5,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import torch.optim as optim
+import sys
 from .nerf_model import NeRF, PoseConditionalNeRF
 from .stylegan import EqualConv2d, EqualLinear
 from .model_utils import flex_grid_ray_sampler, random_or_patch_sampler
@@ -297,6 +298,8 @@ class NeRFGenerator(nn.Module):
         nerf = get_nerf_module(config)
         self.nerf = nerf(config.nerf_params, z_dim=config.z_dim, num_bone=num_bone, bone_length=True,
                          parent=parent_id)
+        lr=0.001
+        self.nerf_optimizer = optim.Adam(self.nerf.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-12)
 
     @property
     def memory_cost(self):
@@ -306,7 +309,7 @@ class NeRFGenerator(nn.Module):
     def flops(self):
         return self.nerf.flops
 
-    def forward(self, pose_to_camera, pose_to_world, bone_length, background=None, z=None, inv_intrinsics=None):
+    def forward(self, pose_to_camera, pose_to_world, bone_length, parsing_soft=None, parsing_hard=None, background=None, z=None, inv_intrinsics=None):
         """
         generate image from 3d bone mask
         :param pose_to_camera: camera coordinate of joint
@@ -322,13 +325,16 @@ class NeRFGenerator(nn.Module):
         patch_size = self.config.patch_size
 
         grid, img_coord = self.ray_sampler(self.size, patch_size, batchsize)
-
+        bs, partnum, _, _ = parsing_soft.shape
+        parsing_soft = torch.gather(parsing_soft.reshape(bs, partnum, -1), dim=2, index=grid[:, None].repeat(1, partnum, 1))
+        parsing_hard = torch.gather(parsing_hard.reshape(bs, -1), dim=1, index=grid)
         # sparse rendering
         if inv_intrinsics is None:
             inv_intrinsics = self.inv_intrinsics
         inv_intrinsics = torch.tensor(inv_intrinsics).float().cuda(img_coord.device)
-        rendered_color, rendered_mask = self.nerf(batchsize, patch_size ** 2, img_coord,
-                                                  pose_to_camera, inv_intrinsics, z,
+        rendered_color, rendered_mask = self.nerf(self.nerf_optimizer, batchsize, patch_size ** 2, img_coord,
+                                                  pose_to_camera, inv_intrinsics, 
+                                                  parsing_soft, parsing_hard, z,
                                                   pose_to_world, bone_length, thres=0.0,
                                                   Nc=self.config.nerf_params.Nc,
                                                   Nf=self.config.nerf_params.Nf)
@@ -458,8 +464,10 @@ class NeRFAutoEncoder(nn.Module):
         nerf = get_nerf_module(config)
         self.nerf = nerf(config.nerf_params, z_dim=config.z_dim, num_bone=num_bone, bone_length=True,
                          parent=parent_id)
+        lr=0.001
+        self.nerf_optimizer = optim.Adam(self.nerf.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-12)
 
-    def forward(self, pose_to_camera, pose_to_world, bone_length, img=None, z=None, background=None, tmp=5.0,
+    def forward(self, pose_to_camera, pose_to_world, bone_length, parsing_soft=None, parsing_hard=None, img=None, z=None, background=None, tmp=5.0,
                 inv_intrinsics=None):
         """
         generate image from 3d bone mask
@@ -481,17 +489,20 @@ class NeRFAutoEncoder(nn.Module):
             z = self.encoder(img)
 
         grid, img_coord = self.ray_sampler(self.size, patch_size, batchsize)
+        bs, partnum, _, _ = parsing_soft.shape
+        parsing_soft = torch.gather(parsing_soft.reshape(bs, partnum, -1), dim=2, index=grid[:, None].repeat(1, partnum, 1))
+        parsing_hard = torch.gather(parsing_hard.reshape(bs, -1), dim=1, index=grid)
 
         # sparse rendering
         if inv_intrinsics is None:
             inv_intrinsics = self.inv_intrinsics
         inv_intrinsics = torch.tensor(inv_intrinsics).float().cuda(img_coord.device)
-        nerf_color, nerf_mask = self.nerf(batchsize, patch_size ** 2, img_coord,
-                                          pose_to_camera, inv_intrinsics, z,
+        nerf_color, nerf_mask = self.nerf(self.nerf_optimizer, batchsize, patch_size ** 2, img_coord,
+                                          pose_to_camera, inv_intrinsics, 
+                                          parsing_soft, parsing_hard, z,
                                           pose_to_world, bone_length, thres=0.0,
                                           Nc=self.config.nerf_params.Nc,
                                           Nf=self.config.nerf_params.Nf)
-
         # merge with background
         if background is None:
             nerf_color = nerf_color + (-1) * (1 - nerf_mask[:, None])  # background is black

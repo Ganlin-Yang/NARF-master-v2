@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-
+import sys
 from .activation import MyReLU
 from .bone_utils import get_canonical_pose
 from .stylegan import EqualLinear, EqualConv1d, NormalizedConv1d
@@ -93,6 +93,9 @@ class NeRF(nn.Module):
         use_world_pose = not config.no_world_pose
         use_ray_direction = not config.no_ray_direction
 
+        self.hidden_size_ = 128
+        self.coarse_number= config.Nc
+
         dim = 3  # xyz
         num_mlp_layers = 8
         self.out_dim = config.out_dim if "out_dim" in self.config else 3
@@ -175,9 +178,24 @@ class NeRF(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
         self.l1 = nn.L1Loss()
         # the following is the classifier network to determine whether the point belongs to inside/outside
-        self.conv_for_encode_p = nn.Conv1d(dim*(self.num_bone+1)*2*self.num_frequency_for_position, hidden_dim_for_mask * (self.num_bone+1), 1)
-        self.conv_for_encode_d = nn.Conv1d(dim*(self.num_bone+1)*2*self.num_frequency_for_other, hidden_dim_for_mask * (self.num_bone+1), 1)
-        self.conv_after_merge = nn.Sequential(nn.Conv1d(hidden_dim_for_mask * (self.num_bone+1), self.num_bone+1, 1), nn.Conv1d(self.num_bone+1, 2, 1))
+        self.conv_for_encode_p = NormalizedConv1d(dim*(self.num_bone+1)*2*self.num_frequency_for_position, hidden_dim_for_mask * (self.num_bone+1), 1)
+        self.conv_for_encode_d = NormalizedConv1d(dim*(self.num_bone+1)*2*self.num_frequency_for_other, hidden_dim_for_mask * (self.num_bone+1), 1)
+        self.conv_after_merge = nn.Sequential(NormalizedConv1d(hidden_dim_for_mask * (self.num_bone+1), self.num_bone+1, 1), NormalizedConv1d(self.num_bone+1, 2, 1))
+
+        # the following is the code used to project the probability distributions of sampled points on a ray into a probability distribution on a 2D pixel
+        self.mlp1= nn.Sequential(EqualLinear(6, self.hidden_size_//2), EqualLinear(self.hidden_size_//2, self.hidden_size_))
+        self.mlp2= nn.Sequential(EqualLinear(3, self.hidden_size_//2), EqualLinear(self.hidden_size_//2, self.hidden_size_),)
+        self.mlp3= nn.Sequential(EqualLinear(self.hidden_size_, self.hidden_size_),EqualLinear(self.hidden_size_, self.hidden_size),)
+
+        self.conv1=NormalizedConv1d(self.coarse_number, self.hidden_size, 1)
+        kk=0
+        modulelist_=list()
+        while self.hidden_size//(4**(kk+1))>1:
+           modulelist_.append(NormalizedConv1d(self.hidden_size//(4**kk),self.hidden_size//(4**(kk+1)),kernel_size=1))
+           kk+=1
+        modulelist_.append(NormalizedConv1d(self.hidden_size//(4**kk), 1, kernel_size=1))
+        self.conv2 = nn.ModuleList(modulelist_)
+
 
     @property
     def memory_cost(self):
@@ -247,8 +265,33 @@ class NeRF(nn.Module):
 
         else:
             return self.mask_x(encoded_x, mask_prob, num_bone=num_bone)
+    
+    def calculate_pro_on_pixel(self, mat_from_world_to_camera, part_probabilty, ray_direction_world):
+        '''
+        mat_from_world_to_camera: (Batchsize, 1, 4, 4)
+        part_probabilty: (Batchsize, part_number+1, sampled_ray_number, sampled_point_number_on_each_ray)
+        ray_direction_world:  (Batchsize, sampled_ray_number, 3)​
+        return out: (Batchsize, part_number+1, sampled_ray_number) 2D-level
 
-    def backbone_(self, p, z=None, j=None, bone_length=None, ray_direction=None):
+        '''
+        Batchsize, part_number, sampled_ray_number, sampled_point_number_on_each_ray = part_probabilty.shape
+        part_probabilty_=part_probabilty.permute(0,2,3,1).reshape(-1, sampled_point_number_on_each_ray, part_number)
+        out1 = self.se3.from_matrix(mat_from_world_to_camera.squeeze(1)).permute(0,2,1).repeat(1,sampled_ray_number,1)
+        out2 = self.mlp1(out1.reshape(-1,6))
+        out3 = self.mlp2(ray_direction_world.reshape(-1,3))
+        out4 = self.mlp3(out2+out3)
+        out4 = out4.repeat(1,part_number).reshape(Batchsize*sampled_ray_number, -1, part_number)
+        out5 = self.conv1(part_probabilty_) + out4
+        for i, l in enumerate(self.conv2):
+             out5=l(out5)
+
+        out6 = out5.reshape(Batchsize,sampled_ray_number,part_number).permute(0,2,1)
+        out = torch.softmax(out6 , dim=1)
+        return out
+    
+    def backbone_(self, p, z=None, j=None, bone_length=None, ray_direction=None, first_time=False):
+        if torch.isnan(p).any() or torch.isnan(j).any() or torch.isnan(bone_length).any() or torch.isnan(ray_direction).any():
+            print("network has nan input")
         batchsize, _, n = p.shape
         act = nn.LeakyReLU(0.2, inplace=True)
         if z is not None:
@@ -314,9 +357,9 @@ class NeRF(nn.Module):
             else:
                 net_bone_length = 0
 
-            return net + net_bone_length, _mask_prob
+            return net + net_bone_length, _mask_prob, scale_factor
 
-        net, mask_prob = clac_p_and_length_feature(p, bone_length, in_or_out_classifier)
+        net, mask_prob, scale_factor = clac_p_and_length_feature(p, bone_length, in_or_out_classifier)
 
         net = net_z + net
 
@@ -383,10 +426,12 @@ class NeRF(nn.Module):
         color = net.reshape(batchsize, self.groups, self.out_dim, n)
         density = self.density_activation(density)
         color = F.tanh(color)
+        if first_time:
+            return density, color, mask_prob/scale_factor
+        else:
+            return density, color
 
-        return density, color
-
-    def backbone(self, p, z=None, j=None, bone_length=None, ray_direction=None):
+    def backbone(self, p, z=None, j=None, bone_length=None, ray_direction=None, first_time= False):
         num_pixels = ray_direction.shape[2]  # number of sampled pixels
         chunk_size = self.config.max_chunk_size // p.shape[0]
         if num_pixels > chunk_size:
@@ -406,9 +451,9 @@ class NeRF(nn.Module):
             return density, color
 
         else:
-            return self.backbone_(p, z, j, bone_length, ray_direction)
+            return self.backbone_(p, z, j, bone_length, ray_direction, first_time= first_time)
 
-    def calc_color_and_density(self, p, z=None, pose_world=None, bone_length=None, ray_direction=None):
+    def calc_color_and_density(self, p, z=None, pose_world=None, bone_length=None, ray_direction=None, first_time =False):
         """
         forward func of ImplicitField
         :param pose_world:
@@ -419,11 +464,17 @@ class NeRF(nn.Module):
         :param ray_direction: b x groups * 3 x m (m = number of ray)
         :return: b x groups x 4 x n
         """
-        density, color = self.backbone(p, z, pose_world, bone_length=bone_length, ray_direction=ray_direction)
+        if first_time:
+            density, color, mask_prob = self.backbone(p, z, pose_world, bone_length=bone_length, ray_direction=ray_direction, first_time=first_time)
+        else:
+            density, color = self.backbone(p, z, pose_world, bone_length=bone_length, ray_direction=ray_direction, first_time=first_time)
         if not self.config.concat:
             # density is zero if p is outside the cube
             density *= in_cube(p)
-        return density, color  # B x groups x 1 x n, B x groups x 3 x n
+        if first_time:
+            return density, mask_prob
+        else:
+            return density, color  # B x groups x 1 x n, B x groups x 3 x n
 
     @staticmethod
     def coord_transform(p: torch.tensor, rotation: torch.tensor, translation: torch.tensor) -> torch.tensor:
@@ -450,8 +501,9 @@ class NeRF(nn.Module):
             density = (density * alpha).sum(dim=1, keepdim=True)
         return density, alpha
 
-    def coarse_to_fine_sample(self, image_coord: torch.tensor, pose_to_camera: torch.tensor,
-                              inv_intrinsics: torch.tensor, z: torch.tensor = None, world_pose: torch.tensor = None,
+    def coarse_to_fine_sample(self, nerf_optimizer, image_coord: torch.tensor, pose_to_camera: torch.tensor,
+                              inv_intrinsics: torch.tensor, parsing_soft: torch.tensor=None,
+                              parsing_hard: torch.tensor=None, z: torch.tensor = None, world_pose: torch.tensor = None,
                               bone_length: torch.tensor = None, near_plane: float = 0.3, far_plane: float = 5,
                               Nc: int = 64, Nf: int = 128, render_scale: float = 1) -> (torch.tensor,) * 3:
         n_samples_to_decide_depth_range = 16
@@ -537,16 +589,53 @@ class NeRF(nn.Module):
 
             ray_direction = ray_direction.reshape(batchsize, (num_bone+1) * 3, n)
 
-            # coarse density
-            coarse_density = self.calc_color_and_density(coarse_points.reshape(batchsize, (num_bone+1) * 3, n * Nc),
-                                                         z, world_pose,
-                                                         bone_length,
-                                                         ray_direction)[0]  # B x groups x n*Nc
+        # coarse density
+        coarse_density, part_prob = self.calc_color_and_density(coarse_points.reshape(batchsize, (num_bone+1) * 3, n * Nc),
+                                                    z, world_pose,
+                                                    bone_length,
+                                                    ray_direction, first_time =True)  # B x groups x n*Nc
+        
+        if nerf_optimizer is not None: 
+            part_probabilty = part_prob.reshape(batchsize, num_bone+1, n, -1)
+            PXP = self.calculate_pro_on_pixel(mat_from_world_to_camera, part_probabilty, ray_direction[:, :3].permute(0,2,1))
+                # input
+            pro_after_merge = torch.zeros_like(parsing_soft)
+            # Background
+            pro_after_merge[:,0]=PXP[:,0]
+            # Head
+            pro_after_merge[:,1]=PXP[:,1+10]
+            # Torso
+            pro_after_merge[:,2]=PXP[:,1+0]+PXP[:,1+3]+PXP[:,1+6]+PXP[:,1+9]
+            # Upper Arms
+            pro_after_merge[:,3]=PXP[:,1+11]+PXP[:,1+12]+PXP[:,1+13]+PXP[:,1+14]
+            # Lower Arms
+            pro_after_merge[:,4]=PXP[:,1+15]+PXP[:,1+16]+PXP[:,1+17]+PXP[:,1+18]
+            # Upper Legs
+            pro_after_merge[:,5]=PXP[:,1+1]+PXP[:,1+2]
+            # Lower Legs
+            pro_after_merge[:,6]=PXP[:,1+4]+PXP[:,1+5]+PXP[:,1+7]+PXP[:,1+8]
+            # target
 
+            # use proba distribution as target
+            parsing_soft = torch.softmax(parsing_soft , dim=1)
+            loss_ = -1*(parsing_soft*torch.log(pro_after_merge)).sum(dim=1)
+            loss_first = loss_.mean()
+
+            # # use one hot vector as target
+            # loss=torch.nn.NLLLoss()
+            # loss_first = loss(torch.log(pro_after_merge), parsing_hard.long())
+            nerf_optimizer.zero_grad()
+            loss_first.backward()
+            # gradient clipping to avoid gradient explode
+            torch.nn.utils.clip_grad_norm_(self.parameters(), 1)
+            nerf_optimizer.step()
+        
+        with torch.no_grad():
+            if torch.isnan(coarse_density).any():
+                print("network has nan output")
             if self.groups > 1:
                 # alpha blending
                 coarse_density, _ = self.sum_density(coarse_density)
-
             # calculate weight for fine sampling
             coarse_density = coarse_density.reshape(batchsize, 1, 1, n, Nc)[:, :, :, :, :-1]
             # # delta = distance between adjacent samples
@@ -590,7 +679,8 @@ class NeRF(nn.Module):
             ray_direction  # B x num_bone*3 x n
         )
 
-    def render(self, image_coord: torch.tensor, pose_to_camera: torch.tensor, inv_intrinsics: torch.tensor,
+    def render(self, nerf_optimizer, image_coord: torch.tensor, pose_to_camera: torch.tensor, inv_intrinsics: torch.tensor,
+               parsing_soft: torch.tensor=None, parsing_hard: torch.tensor=None,
                z: torch.tensor = None, world_pose: torch.tensor = None, bone_length: torch.tensor = None,
                thres: float = 0.9, render_scale: float = 1, Nc: int = 64, Nf: int = 128,
                semantic_map: bool = False) -> (torch.tensor,) * 3:
@@ -602,8 +692,10 @@ class NeRF(nn.Module):
 
         batchsize, num_bone, _, n = image_coord.shape
 
-        fine_depth, fine_points, ray_direction = self.coarse_to_fine_sample(image_coord, pose_to_camera,
+        fine_depth, fine_points, ray_direction = self.coarse_to_fine_sample(nerf_optimizer, image_coord, pose_to_camera,
                                                                             inv_intrinsics,
+                                                                            parsing_soft=parsing_soft,
+                                                                            parsing_hard=parsing_hard,
                                                                             z=z, world_pose=world_pose,
                                                                             bone_length=bone_length,
                                                                             near_plane=near_plane, Nc=Nc, Nf=Nf,
@@ -664,7 +756,8 @@ class NeRF(nn.Module):
 
         return rendered_color, rendered_mask, rendered_disparity
 
-    def forward(self, batchsize, num_sample, sampled_img_coord, pose_to_camera, inv_intrinsics, z=None,
+    def forward(self, nerf_optimizer, batchsize, num_sample, sampled_img_coord, pose_to_camera, inv_intrinsics, 
+                parsing_soft=None, parsing_hard=None, z=None,
                 world_pose=None, bone_length=None, thres=0.9, render_scale=1, Nc=64, Nf=128):
         """
         rendering function for sampled rays
@@ -687,9 +780,11 @@ class NeRF(nn.Module):
         if not self.config.concat_pose:
             sampled_img_coord = sampled_img_coord.repeat(1, self.num_bone+1, 1, 1)
 
-        merged_color, merged_mask, _ = self.render(sampled_img_coord,
+        merged_color, merged_mask, _ = self.render(nerf_optimizer, sampled_img_coord,
                                                    pose_to_camera,
                                                    inv_intrinsics,
+                                                   parsing_soft=parsing_soft,
+                                                   parsing_hard=parsing_hard,
                                                    z=z,
                                                    world_pose=world_pose,
                                                    bone_length=bone_length,
@@ -719,7 +814,7 @@ class NeRF(nn.Module):
         img_coord = img_coord[None, None].cuda()
 
         if not self.config.concat_pose:
-            img_coord = img_coord.repeat(1, self.num_bone, 1, 1)
+            img_coord = img_coord.repeat(1, self.num_bone+1, 1, 1)
 
         rendered_color = []
         rendered_mask = []
@@ -728,7 +823,8 @@ class NeRF(nn.Module):
         with torch.no_grad():
             for i in range(0, render_size ** 2, batchsize):
                 (rendered_color_i, rendered_mask_i,
-                 rendered_disparity_i) = self.render(img_coord[:, :, :, i:i + batchsize],
+                 rendered_disparity_i) = self.render(None,    # nerf optimizer is none when validate
+                                                     img_coord[:, :, :, i:i + batchsize],
                                                      pose_to_camera[:1],
                                                      inv_intrinsics,
                                                      z=z,

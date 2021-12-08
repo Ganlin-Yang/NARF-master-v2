@@ -231,7 +231,7 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
 
     if ddp:
         gen = torch.nn.SyncBatchNorm.convert_sync_batchnorm(gen)
-        gen = nn.parallel.DistributedDataParallel(gen, device_ids=[n_gpu])
+        gen = nn.parallel.DistributedDataParallel(gen, device_ids=[n_gpu], find_unused_parameters=True)
 
     gen_optimizer = optim.Adam(gen.parameters(), lr=config.lr, betas=(0.9, 0.999), eps=1e-12)
 
@@ -267,8 +267,10 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
     train_start = time.time()
 
     val_interval = config.val_interval
+    # val_interval =1
     print_interval = config.print_interval
-    tensorboard_interval = config.tensorboard_interval
+    tensorboard_interval = 1
+    # tensorboard_interval = config.tensorboard_interval
     save_interval = config.save_interval
 
     while iter < num_iter:
@@ -282,6 +284,8 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
             batch = {key: val.cuda(non_blocking=True).float() for key, val in data.items()}
             img = batch["img"]
             mask = batch["mask"]
+            parsing_soft=batch["parsing_soft"]
+            parsing_hard=batch["parsing_hard"]
 
             if "disparity" in batch:
                 disparity = batch["disparity"]
@@ -301,7 +305,7 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
             if config.auto_encoder:
                 if not cnn_based:
                     nerf_color, nerf_mask, grid = gen(pose_to_camera, pose_to_world,
-                                                      bone_length, img, inv_intrinsics=inv_intrinsics)
+                                                      bone_length, parsing_soft, parsing_hard, img, inv_intrinsics=inv_intrinsics)
                     loss_color, loss_mask = loss_func(grid, nerf_color, nerf_mask, img, mask)
                     loss = loss_color + loss_mask
                 else:
@@ -313,7 +317,7 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
                     loss = loss_color + loss_mask
 
             elif not cnn_based:
-                nerf_color, nerf_mask, grid = gen(pose_to_camera, pose_to_world, bone_length,
+                nerf_color, nerf_mask, grid = gen(pose_to_camera, pose_to_world, bone_length, parsing_soft, parsing_hard,
                                                   inv_intrinsics=inv_intrinsics)
                 loss_color, loss_mask = loss_func(grid, nerf_color, nerf_mask, img, mask)
                 loss = loss_color + loss_mask
@@ -330,8 +334,9 @@ def train_func(config, dataset, data_loader, rank, ddp=False, world_size=1):
 
             if (iter + 1) % tensorboard_interval == 0 and rank == 0:  # tensorboard
                 write(iter, loss, "gen", writer)
+                print(loss)
             loss.backward()
-
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), 1)
             gen_optimizer.step()
             # update selector tmp
             if config.generator_params.nerf_params.selector_adaptive_tmp.gamma != 1:
@@ -459,7 +464,8 @@ def validation_func(config, dataset, data_loader, rank, ddp=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default="NARF/configs/THUman/autoencoder/NARF_D.yml")
+    # parser.add_argument('--config', type=str, default="NARF/configs/THUman/autoencoder/NARF_D.yml")
+    parser.add_argument('--config', type=str, default="NARF/configs/THUman/results_gyx_20181017_lst_1_F/NARF_D.yml")
     parser.add_argument('--default_config', type=str, default="NARF/configs/default.yml")
     parser.add_argument('--resume_latest', action="store_true")
     parser.add_argument('--num_workers', type=int, default=1)

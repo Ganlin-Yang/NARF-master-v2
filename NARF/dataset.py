@@ -39,6 +39,7 @@ class THUmanDataset(Dataset):
         self.just_cache = just_cache
 
         self.imgs = self.cache_image()
+        self.parsing_gt =self.cache_parse()
         if self.return_bone_params:
             self.pose_to_world_, self.pose_to_camera_, self.inv_intrinsics_ = self.cache_bone_params()
             self.pose_to_camera_[:,:,3,3]=1.
@@ -54,6 +55,7 @@ class THUmanDataset(Dataset):
         self.data_idx = data_idx
 
         self.imgs = self.imgs[data_idx]
+        self.parsing_gt = self.parsing_gt[data_idx]
         self.parents = np.array([-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9,
                                  12, 13, 14, 16, 17, 18, 19, 20, 21])
         self.output_parents = get_final_papernt_id(self.parents)
@@ -96,6 +98,21 @@ class THUmanDataset(Dataset):
             self.background_imgs = np.load(self.config.background_path)
 
         return imgs
+
+    def cache_parse(self):
+        if os.path.exists(f"{self.data_root}/render_{self.size}_parsing.npy"):
+            parsing_gt = np.load(f"{self.data_root}/render_{self.size}_parsing.npy")
+        
+        else:
+            parsing_gt = []
+            parsing_path=glob.glob(f"{self.data_root}/render_{self.size}/image_parsing_gt/*.npy")
+            for path in tqdm(sorted(parsing_path)):
+                parsing=np.load(path)
+                parsing_gt.append(parsing)
+            parsing_gt =np.array(parsing_gt)
+            np.save(f"{self.data_root}/render_{self.size}_parsing.npy", parsing_gt)
+
+        return parsing_gt
 
     def cache_bone_params(self):
         if os.path.exists(f"{self.data_root}/render_{self.size}_pose_to_world.npy"):
@@ -181,8 +198,11 @@ class THUmanDataset(Dataset):
         img = (img / 127.5 - 1).astype("float32")  # 3 x 128 x 128
         img = img[::-1].copy()  # BGR2RGB
         mask = mask.astype("float32")  # 1 x 128 x 128
+        # parsing_soft :(hang,lie,7)->(7,hang,lie)
+        parsing_soft = self.parsing_gt[i].transpose(2,0,1)
+        parsing_hard=np.argmax(parsing_soft,axis=0)
 
-        return_dict = {"img": img, "mask": mask, "idx": self.data_idx[i]}
+        return_dict = {"img": img, "mask": mask, "idx": self.data_idx[i], "parsing_soft": parsing_soft, "parsing_hard": parsing_hard}
 
         if self.return_bone_params:
             pose_to_world = self.pose_to_world[i]

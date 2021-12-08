@@ -1,38 +1,45 @@
-out_root: ./trained_models # <- need change
+# out_root: ./trained_models # <- need change
+out_root: /data/v-ganlinyang/trained_models/
 out: autoencoder_NARF_D # <- need change
 
 dataset:
   name: human
-  bs: 4 # batchsize
+  # bs: 4 # batchsize
+  bs: 2
   image_size: 128
   train:
     train: True
-    data_root: ./data/THUman/all/train  # <- need change
+    # data_root: ./data/THUman/all/train  # <- need change
+    data_root: /data/v-ganlinyang/data/THUman/all/train
     n_mesh: 3545
     n_rendered_per_mesh: 10
     n_imgs_per_mesh: 10
   val:
     same_dist:
       train: True
-      data_root: ./data/THUman/all/same_view  # <- need change
+      # data_root: ./data/THUman/all/same_view  # <- need change
+      data_root: /data/v-ganlinyang/data/THUman/all/same_view
       n_mesh: 3545
       n_rendered_per_mesh: 1
       n_imgs_per_mesh: 1
     novel_pose:
       train: False
-      data_root: ./data/THUman/all/same_view  # <- need change
+      # data_root: ./data/THUman/all/same_view  # <- need change
+      data_root: /data/v-ganlinyang/data/THUman/all/same_view
       n_mesh: 394
       n_rendered_per_mesh: 1
       n_imgs_per_mesh: 1
     novel_view:
       train: True
-      data_root: ./data/THUman/all/novel_view  # <- need change
+      # data_root: ./data/THUman/all/novel_view  # <- need change
+      data_root: /data/v-ganlinyang/data/THUman/all/novel_view
       n_mesh: 3545
       n_rendered_per_mesh: 1
       n_imgs_per_mesh: 1
     novel_pose_novel_view:
       train: False
-      data_root: ./data/THUman/all/novel_view  # <- need change
+      # data_root: ./data/THUman/all/novel_view  # <- need change
+      data_root: /data/v-ganlinyang/data/THUman/all/novel_view
       n_mesh: 394
       n_rendered_per_mesh: 1
       n_imgs_per_mesh: 1

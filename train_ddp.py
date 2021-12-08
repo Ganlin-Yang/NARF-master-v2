@@ -48,7 +48,8 @@ def create_dataloader(config_dataset, rank, world_size):
 # for the master node
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default="NARF/configs/THUman/autoencoder/NARF_D.yml")
+    # parser.add_argument('--config', type=str, default="NARF/configs/THUman/autoencoder/NARF_D.yml")
+    parser.add_argument('--config', type=str, default="NARF/configs/THUman/results_gyx_20181017_lst_1_F/NARF_D.yml")
     parser.add_argument('--default_config', type=str, default="NARF/configs/default.yml")
     parser.add_argument('--resume_latest', action="store_true")
     parser.add_argument('--gpus', type=int, default=1)
